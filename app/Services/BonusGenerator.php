@@ -7,13 +7,11 @@ use App\Models\Sale;
 use App\Models\User;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\DB;
-use App\Exceptions\BonusGenerationException;
 
 class BonusGenerator
 {
     /**
-     * Define los niveles de bonos.
-     * La clave es el monto mínimo de ventas y el valor es el monto del bono.
+     * Niveles de bonos: clave = monto mínimo, valor = monto del bono.
      */
     protected array $bonusLevels = [
         100000 => 2000,
@@ -23,9 +21,6 @@ class BonusGenerator
 
     /**
      * Devuelve los niveles de bonos.
-     * Esto permite que otras clases (como GenerateBonus) accedan a ellos.
-     *
-     * @return array
      */
     public function getBonusLevels(): array
     {
@@ -33,46 +28,58 @@ class BonusGenerator
     }
 
     /**
-     * Genera un bono para un usuario basado en las ventas seleccionadas.
+     * Genera un bono para un usuario usando solo las ventas necesarias.
      *
      * @param User $user
      * @param Collection|array $sales
-     * @return Bonus
-     * @throws BonusGenerationException
+     * @return Bonus|null
      */
-    public function generate(User $user, Collection|array $sales): Bonus
+    public function generate(User $user, Collection|array $sales): ?Bonus
     {
         $sales = $sales instanceof Collection ? $sales : collect($sales);
 
-        // Bloqueo pesimista para evitar condiciones de carrera.
+        if ($sales->isEmpty()) {
+            return null;
+        }
+
         DB::beginTransaction();
 
         try {
-            // Re-obtener las ventas con bloqueo para la transacción.
+            // Re-obtener las ventas con bloqueo
             $saleIds = $sales->pluck('id')->toArray();
             $lockedSales = Sale::whereIn('id', $saleIds)
                                ->lockForUpdate()
                                ->get();
 
-            // Validación de las reglas de negocio.
-            $this->validateRules($user, $lockedSales);
+            // Filtrar ventas válidas del usuario y no canjeadas
+            $validSales = $lockedSales->filter(fn($sale) => $sale->user_id === $user->id && !$sale->canjeado);
 
-            // Determina el monto del bono.
-            $bonusAmount = $this->determineBonusAmount($lockedSales);
-            if (!$bonusAmount) {
-                throw new BonusGenerationException('No se alcanzó el monto mínimo para generar un bono.');
+            // Validar porcentaje pagado mínimo del 40%
+            $totalAmount = $validSales->sum('total_amount');
+            $paidAmount = $validSales->sum('paid_amount');
+            if ($totalAmount < min(array_keys($this->bonusLevels)) || ($paidAmount / $totalAmount) * 100 < 40) {
+                return null;
             }
 
-            // Crear el bono y asociar las ventas.
+            // Determinar el bono y las ventas mínimas necesarias
+            $result = $this->determineBonusAmount($validSales);
+            if (!$result) {
+                return null;
+            }
+
+            $bonusAmount = $result['amount'];
+            $selectedSales = $result['sales'];
+
+            // Crear bono y asociar ventas
             $bonus = Bonus::create([
                 'user_id' => $user->id,
                 'amount' => $bonusAmount,
             ]);
 
-            $bonus->sales()->attach($lockedSales->pluck('id'));
+            $bonus->sales()->attach($selectedSales->pluck('id'));
 
-            // Marcar las ventas como canjeadas.
-            Sale::whereIn('id', $saleIds)->update(['canjeado' => true]);
+            // Marcar solo las ventas usadas como canjeadas
+            Sale::whereIn('id', $selectedSales->pluck('id'))->update(['canjeado' => true]);
 
             DB::commit();
 
@@ -80,56 +87,41 @@ class BonusGenerator
 
         } catch (\Throwable $e) {
             DB::rollBack();
-            throw new BonusGenerationException('Error al generar el bono: ' . $e->getMessage(), 0, $e);
+            return null;
         }
     }
 
     /**
-     * Valida las reglas de negocio para la generación del bono.
-     *
-     * @param User $user
-     * @param Collection $sales
-     * @throws BonusGenerationException
-     */
-    protected function validateRules(User $user, Collection $sales): void
-    {
-        // Validación de que todas las ventas pertenecen al usuario y no están canjeadas.
-        if ($sales->some(fn($sale) => $sale->user_id !== $user->id)) {
-            throw new BonusGenerationException('Una o más ventas no pertenecen al usuario.');
-        }
-
-        if ($sales->some(fn($sale) => $sale->canjeado)) {
-            throw new BonusGenerationException('Una o más ventas ya han sido canjeadas.');
-        }
-
-        $totalAmount = $sales->sum('total_amount');
-        $paidAmount = $sales->sum('paid_amount');
-
-        if ($totalAmount < min(array_keys($this->bonusLevels))) {
-            throw new BonusGenerationException('El monto total de ventas no es suficiente para un bono.');
-        }
-
-        if (($paidAmount / $totalAmount) * 100 < 40) {
-            throw new BonusGenerationException('El porcentaje de pagos no alcanza el 40% del monto total.');
-        }
-    }
-
-    /**
-     * Determina el monto del bono basado en el total de ventas.
+     * Determina el monto del bono y las ventas mínimas necesarias.
      *
      * @param Collection $sales
-     * @return float|null
+     * @return array|null ['amount' => float, 'sales' => Collection]
      */
-    protected function determineBonusAmount(Collection $sales): ?float
+    protected function determineBonusAmount(Collection $sales): ?array
     {
-        $totalAmount = $sales->sum('total_amount');
-
-        // Ordenar los niveles de bono de mayor a menor.
         krsort($this->bonusLevels);
 
+        // Ordenar ventas de mayor a menor
+        $sales = $sales->sortByDesc('total_amount')->values();
+        $totalSalesAmount = $sales->sum('total_amount');
+
         foreach ($this->bonusLevels as $minTotal => $bonus) {
-            if ($totalAmount >= $minTotal) {
-                return (float) $bonus;
+            if ($totalSalesAmount >= $minTotal) {
+                $accumulated = 0;
+                $selectedSales = collect();
+
+                foreach ($sales as $sale) {
+                    $accumulated += $sale->total_amount;
+                    $selectedSales->push($sale);
+                    if ($accumulated >= $minTotal) {
+                        break;
+                    }
+                }
+
+                return [
+                    'amount' => (float) $bonus,
+                    'sales' => $selectedSales,
+                ];
             }
         }
 

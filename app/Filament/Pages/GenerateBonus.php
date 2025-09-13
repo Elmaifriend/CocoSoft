@@ -14,6 +14,7 @@ class GenerateBonus extends Page
 {
     protected static ?string $navigationIcon = 'heroicon-o-currency-dollar';
     protected static ?string $navigationLabel = 'Generar Bonos';
+    protected static ?string $navigationGroup = 'Bonos';
     protected static ?int $navigationSort = 2;
     protected static string $view = 'filament.pages.generate-bonus';
 
