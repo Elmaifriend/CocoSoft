@@ -21,9 +21,9 @@ class DatabaseSeeder extends Seeder
         ]);
 
         $user = User::factory()->create([
-            'name' => 'Vendedor de Prueba',
-            'email' => 'vendedor@test.com',
-            'password' => Hash::make('password'),
+            'name' => 'Valeria Gonzalez',
+            'email' => 'valerina@capuchina.com',
+            'password' => Hash::make('admin'),
         ]);
 
         $clients = Client::factory()->count(10)->create();

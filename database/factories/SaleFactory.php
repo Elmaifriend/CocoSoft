@@ -13,6 +13,8 @@ class SaleFactory extends Factory
         return [
             'user_id' => User::factory(),
             'client_id' => Client::factory(),
+            "product" => fake()->sentence(),
+            "description" => fake()->paragraphs(2, true),
             'total_amount' => $this->faker->numberBetween(5000, 30000),
             'canjeado' => false,
         ];

@@ -2,105 +2,171 @@
 
 namespace App\Filament\Pages;
 
+use Filament\Pages\Page;
 use App\Models\Sale;
 use App\Services\BonusGenerator;
-use Filament\Forms\Concerns\InteractsWithForms;
-use Filament\Forms\Contracts\HasForms;
-use Filament\Notifications\Notification;
-use Filament\Pages\Page;
-use Filament\Tables\Columns\TextColumn;
-use Filament\Tables\Contracts\HasTable;
-use Filament\Tables\Concerns\InteractsWithTable;
-use Illuminate\Database\Eloquent\Builder;
-use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Auth;
+use Filament\Notifications\Notification;
+use App\Exceptions\BonusGenerationException;
 
-class GenerateBonus extends Page implements HasForms, HasTable
+class GenerateBonus extends Page
 {
-    use InteractsWithForms;
-    use InteractsWithTable;
-
-    protected static ?string $navigationIcon = 'heroicon-o-gift';
-    protected static string $view = 'filament.pages.generate-bonus';
+    protected static ?string $navigationIcon = 'heroicon-o-currency-dollar';
     protected static ?string $navigationLabel = 'Generar Bonos';
-    protected static ?string $title = 'Generar Bonos';
-    protected static ?string $navigationGroup = 'Bonos';
+    protected static ?int $navigationSort = 2;
+    protected static string $view = 'filament.pages.generate-bonus';
 
+    public array $selectedSales = [];
+    public float $totalAmountSelected = 0;
+    public float $paidAmountSelected = 0;
+    public float $paidPercentage = 0;
+    public array $availableBonuses = [];
+    public ?array $bonusForConfirmation = null;
+    public Collection $sales;
+    public Collection $selectedSalesData;
 
-    public ?array $bonusOptions = null;
-    public float $totalAmount = 0;
-    public float $paidAmount = 0;
-    public Collection $eligibleSales;
+    protected $bonusGenerator;
 
     public function mount(): void
     {
-        $this->eligibleSales = $this->getTableQuery()->get();
-        $this->previewBonus();
+        $this->bonusGenerator = new BonusGenerator();
+        $this->loadSales();
+        $this->selectedSalesData = collect();
     }
 
-    protected function getTableQuery(): Builder
+    public function loadSales(): void
     {
-        return Sale::query()
-            ->where('user_id', auth()->id())
+        $this->sales = Sale::query()
+            ->where('user_id', Auth::id())
             ->where('canjeado', false)
-            ->latest();
+            ->orderBy('created_at', 'desc')
+            ->get();
     }
 
-    protected function getTableColumns(): array
+    public function updatedSelectedSales(): void
     {
-        return [
-            TextColumn::make('client.name')->label('Cliente')->searchable(),
-            TextColumn::make('total_amount')->label('Monto total')->money('USD'),
-            TextColumn::make('paid_amount')->label('Monto pagado')->money('USD'),
-        ];
+        $this->recalculateTotalsAndBonuses();
+        $this->bonusForConfirmation = null;
     }
 
-    public function previewBonus(): void
+    public function toggleSale(int $saleId): void
     {
-        $sales = $this->eligibleSales;
+        if (in_array($saleId, $this->selectedSales)) {
+            $this->selectedSales = array_diff($this->selectedSales, [$saleId]);
+        } else {
+            $this->selectedSales[] = $saleId;
+        }
 
-        if ($sales->isEmpty()) {
-            $this->bonusOptions = [];
+        $this->recalculateTotalsAndBonuses();
+        $this->bonusForConfirmation = null;
+    }
+
+    public function recalculateTotalsAndBonuses(): void
+    {
+        if (empty($this->selectedSales)) {
+            $this->resetCalculations();
             return;
         }
 
-        $this->totalAmount = $sales->sum('total_amount');
-        $this->paidAmount = $sales->sum('paid_amount');
+        $sales = Sale::whereIn('id', $this->selectedSales)->get();
+        $this->selectedSalesData = $sales;
 
-        $levels = [100000 => 2000, 75000 => 1500, 50000 => 1000];
+        $this->totalAmountSelected = $sales->sum('total_amount');
+        $this->paidAmountSelected = $sales->sum('paid_amount');
+        $this->paidPercentage = ($this->totalAmountSelected > 0)
+            ? ($this->paidAmountSelected / $this->totalAmountSelected) * 100
+            : 0;
 
-        $this->bonusOptions = [];
-        foreach ($levels as $minTotal => $bonus) {
-            if ($this->totalAmount >= $minTotal && ($this->paidAmount / $this->totalAmount) * 100 >= 40) {
-                $this->bonusOptions[$bonus] = [
-                    'monto' => $bonus,
-                    'monto_minimo_ventas' => $minTotal,
-                    'pagos_cumplen' => true
+        $this->availableBonuses = $this->determineAvailableBonuses($sales);
+    }
+
+    protected function determineAvailableBonuses(Collection $sales): array
+    {
+        if (!isset($this->bonusGenerator)) {
+            $this->bonusGenerator = new BonusGenerator();
+        }
+
+        if ($this->paidPercentage < 40) {
+            return [];
+        }
+
+        $total = $sales->sum('total_amount');
+        $bonusLevels = $this->bonusGenerator->getBonusLevels();
+        $qualifiedBonuses = [];
+
+        foreach ($bonusLevels as $minTotal => $bonusAmount) {
+            if ($total >= $minTotal) {
+                $qualifiedBonuses[] = [
+                    'amount' => $bonusAmount,
+                    'min_total' => $minTotal,
                 ];
             }
         }
+
+        return collect($qualifiedBonuses)->sortByDesc('amount')->values()->all();
     }
 
-    public function generateBonus(float $bonusAmount, BonusGenerator $generator): void
+    public function selectBonusForConfirmation(int $amount, int $minTotal): void
     {
+        $this->bonusForConfirmation = [
+            'amount' => $amount,
+            'min_total' => $minTotal,
+        ];
+    }
+
+    public function generateBonus(): void
+    {
+        if (empty($this->selectedSales)) {
+            Notification::make()->title('Error')->body('No hay ventas seleccionadas.')->danger()->send();
+            return;
+        }
+
         try {
-            $bonus = $generator->generate(Auth::user(), $this->eligibleSales);
+            $salesToProcess = Sale::whereIn('id', $this->selectedSales)->get();
+
+            // Crear nueva instancia aquí
+            $bonusGenerator = new BonusGenerator();
+
+            $bonus = $bonusGenerator->generate(Auth::user(), $salesToProcess);
 
             Notification::make()
-                ->title('¡Bono generado con éxito!')
-                ->body("Se ha generado un bono de {$bonus->amount} USD.")
+                ->title('Bono generado')
+                ->body("Se generó un bono de $".number_format($bonus->amount, 2))
                 ->success()
                 ->send();
 
-            $this->eligibleSales = $this->getTableQuery()->get();
-            $this->previewBonus();
+            // Recargar la página
+            redirect()->route('filament.admin.resources.bonuses.index');
 
-        } catch (\App\Exceptions\BonusGenerationException $e) {
+        } catch (BonusGenerationException $e) {
             Notification::make()
                 ->title('Error al generar bono')
                 ->body($e->getMessage())
                 ->danger()
                 ->send();
+            $this->bonusForConfirmation = null;
         }
+    }
+
+    protected function resetCalculations(): void
+    {
+        $this->totalAmountSelected = 0;
+        $this->paidAmountSelected = 0;
+        $this->paidPercentage = 0;
+        $this->availableBonuses = [];
+        $this->bonusForConfirmation = null;
+        $this->selectedSalesData = collect();
+    }
+
+    public function toggleSelectAll(): void
+    {
+        if (count($this->selectedSales) === $this->sales->count()) {
+            $this->selectedSales = [];
+        } else {
+            $this->selectedSales = $this->sales->pluck('id')->toArray();
+        }
+
+        $this->recalculateTotalsAndBonuses();
     }
 }

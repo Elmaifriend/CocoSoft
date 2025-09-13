@@ -22,6 +22,17 @@ class BonusGenerator
     ];
 
     /**
+     * Devuelve los niveles de bonos.
+     * Esto permite que otras clases (como GenerateBonus) accedan a ellos.
+     *
+     * @return array
+     */
+    public function getBonusLevels(): array
+    {
+        return $this->bonusLevels;
+    }
+
+    /**
      * Genera un bono para un usuario basado en las ventas seleccionadas.
      *
      * @param User $user

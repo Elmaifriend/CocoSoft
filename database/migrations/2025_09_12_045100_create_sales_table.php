@@ -12,6 +12,8 @@ return new class extends Migration
             $table->id();
             $table->foreignId('user_id')->constrained()->cascadeOnDelete();
             $table->foreignId('client_id')->constrained()->cascadeOnDelete();
+            $table->text("product");
+            $table->text("description");
             $table->decimal('total_amount', 10, 2);
             $table->boolean('canjeado')->default(false);
             $table->timestamps();
